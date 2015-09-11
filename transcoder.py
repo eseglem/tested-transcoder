@@ -89,7 +89,7 @@ class Transcoder(object):
             msg = 'Unable to mount Virtual Box Share: %s' % ex.output
             sys.stdout.write(msg)
             sys.stdout.flush()
-            return False
+            return True
         return True
 
     def setup_logging(self):

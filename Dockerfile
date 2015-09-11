@@ -1,19 +1,15 @@
-FROM ubuntu:trusty64
+FROM ubuntu:trusty
 
-RUN add-apt-repository -y ppa:stebbins/handbrake-releases \
-    && add-apt-repository -y ppa:mc3man/trusty-media \
+RUN echo "deb http://ppa.launchpad.net/stebbins/handbrake-releases/ubuntu trusty main" >> /etc/apt/sources.list \ 
+    && echo "deb http://ppa.launchpad.net/mc3man/trusty-media/ubuntu trusty main" >> /etc/apt/sources.list \
     && apt-get update \
-    && apt-get install -y make git mkvtoolnix handbrake-cli mplayer \
-    ffmpeg mp4v2-utils linux-headers-generic build-essential dkms supervisor
+    && apt-get install --force-yes -y git mkvtoolnix handbrake-cli mplayer ffmpeg mp4v2-utils
+
+COPY transcoder.py /usr/local/bin/
 
 RUN git clone https://github.com/donmelton/video-transcoding-scripts \
     && mv video-transcoding-scripts/*.sh /usr/local/bin/ \
-    && rm -rf video-transcoding-scripts
+    && rm -rf video-transcoding-scripts \
+    && chmod +x /usr/local/bin/transcoder.py
 
-COPY supervisor-config.conf /etc/supervisor/conf.d/
-COPY transcoder.py /usr/local/
-
-RUN mkdir -p /media/transcoder \
-    && chmod +x /usr/local/bin/transcoder.py \
-
-CMD ["/usr/bin/supervisord"]
+CMD ["python", "/usr/local/bin/transcoder.py"]
