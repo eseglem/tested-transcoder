@@ -1,5 +1,3 @@
-#!/usr/bin/python
-
 import logging
 import os
 import re
@@ -23,8 +21,6 @@ def non_zero_min(values):
 
 class Transcoder(object):
 
-    # name of the share defined in virtualbox that will contain input/output video
-    VBOX_SHARE_NAME = 'transcoder'
     # path to mount the virtual box share
     TRANSCODER_ROOT = "/media/transcoder"
     # directory containing new video to transcode
@@ -32,12 +28,20 @@ class Transcoder(object):
     # directory where handbrake will save the output to. this is a temporary
     # location and the file is moved to OUTPUT_DIRECTORY after complete
     WORK_DIRECTORY = TRANSCODER_ROOT + '/work'
+    # temporary directory for the original to be moved to while processing.
+    # this allows for multiple docker containers to be run on the same folder.
+    PROCESSING_DIRECTORY = TRANSCODER_ROOT + '/processing'
     # directory containing the original inputs after they've been transcoded
     COMPLETED_DIRECTORY = TRANSCODER_ROOT + '/completed-originals'
-    # directory contained the compressed outputs
+    # directory containing the compressed outputs
     OUTPUT_DIRECTORY = TRANSCODER_ROOT + '/output'
-    # standard options for the transcode-video script
-    TRANSCODE_OPTIONS = '--mkv --slow --allow-dts --allow-ac3 --copy-all-ac3 --single --no-auto-burn'
+    # directory for storage of crops
+    CROP_DIRECTORY = TRANSCODER_ROOT + '/crops'
+    # standard options for the transcode-video script from input args. put
+    # defaults in first string and all additional arguments will be added.
+    TRANSCODE_OPTIONS = ''
+    if len(sys.argv) > 1:
+        TRANSCODE_OPTIONS += ' '.join(sys.argv[1:])
     # number of seconds a file must remain unmodified in the INPUT_DIRECTORY
     # before it is considered done copying. increase this value for more
     # tolerance on bad network connections.
@@ -71,27 +75,6 @@ class Transcoder(object):
         out = subprocess.check_output(args=args, stderr=subprocess.STDOUT)
         return out
 
-    def mount_share(self):
-        """
-        Mount the VBox share if it's not already mounted.
-        Returns True if mounted, otherwise False.
-        """
-        out = self.execute('mount')
-        if '%s type vboxsf' % self.TRANSCODER_ROOT in out:
-            return True
-        # attempt to mount
-        uid, gid = os.getuid(), os.getgid()
-        command = 'sudo mount -t vboxsf -o uid=%s,gid=%s %s %s' % (
-            uid, gid, self.VBOX_SHARE_NAME, self.TRANSCODER_ROOT)
-        try:
-            self.execute(command)
-        except subprocess.CalledProcessError as ex:
-            msg = 'Unable to mount Virtual Box Share: %s' % ex.output
-            sys.stdout.write(msg)
-            sys.stdout.flush()
-            return True
-        return True
-
     def setup_logging(self):
         self.logger = logging.getLogger('transcoder')
         self.logger.setLevel(logging.DEBUG)
@@ -105,10 +88,9 @@ class Transcoder(object):
     def check_filesystem(self):
         "Checks that the filesystem and logger is setup properly"
         dirs = (self.INPUT_DIRECTORY, self.WORK_DIRECTORY,
-                self.OUTPUT_DIRECTORY, self.COMPLETED_DIRECTORY)
+                self.OUTPUT_DIRECTORY, self.COMPLETED_DIRECTORY,
+                self.PROCESSING_DIRECTORY, self.CROP_DIRECTORY)
         if not all(map(os.path.exists, dirs)):
-            if not self.mount_share():
-                return False
             for path in dirs:
                 if not os.path.exists(path):
                     try:
@@ -166,7 +148,13 @@ class Transcoder(object):
                 except IOError:
                     continue
 
-                self.process_input(path)
+                # Race condition could cause IOError, just skip the file, since
+                # it is already being process by another worker.
+                try:
+                    self.process_input(path)
+                except IOError:
+                    continue
+
                 # move the source to the COMPLETED_DIRECTORY
                 dst = os.path.join(self.COMPLETED_DIRECTORY,
                                    os.path.basename(path))
@@ -177,6 +165,13 @@ class Transcoder(object):
         name = os.path.basename(path)
         self.logger.info('Found new input "%s"', name)
 
+        # move file to a processing directory so it won't be picked up agian
+        # possible race condition in paarallel, allow it to raise an error
+        processing_path = os.path.join(self.PROCESSING_DIRECTORY,
+                                       os.path.basename(path))
+        shutil.move(path, processing_path)
+        path = processing_path
+
         # if any of the following functions return no output, something
         # bad happened and we can't continue
 
@@ -185,13 +180,8 @@ class Transcoder(object):
         if not meta:
             return
 
-        # determine crop dimensions
-        crop = self.detect_crop(path)
-        if not crop:
-            return
-
         # transcode the video
-        work_path = self.transcode(path, crop, meta)
+        work_path = self.transcode(path, meta)
         if not work_path:
             return
 
@@ -221,40 +211,7 @@ class Transcoder(object):
         # process out
         return out
 
-    def detect_crop(self, path):
-        crop_re = r'[0-9]+:[0-9]+:[0-9]+:[0-9]+'
-        name = os.path.basename(path)
-        self.logger.info('Detecting crop for input "%s"', name)
-        command = 'detect-crop.sh --values-only "%s"' % path
-        try:
-            out = self.execute(command)
-        except subprocess.CalledProcessError as ex:
-            # when detect-crop detects discrepancies between handbrake and
-            # mplayer, each crop is written out but detect-crop also returns
-            # an error code. if this is the case, we don't want to error out.
-            if re.findall(crop_re, ex.output):
-                out = ex.output
-            else:
-                self.logger.info('detect-crop failed for input "%s", '
-                                 'proceeding with no crop. error: %s',
-                                 name, ex.output)
-                return '0:0:0:0'
-
-        crops = re.findall(crop_re, out)
-        if not crops:
-            self.logger.info('No crop found for input "%s", '
-                             'proceeding with no crop', name)
-
-            return '0:0:0:0'
-        else:
-            # use the smallest crop for each edge. prefer non-zero values if
-            # they exist
-            dimensions = zip(*[map(int, c.split(':')) for c in crops])
-            crop = ':'.join(map(str, [non_zero_min(piece) for piece in dimensions]))
-            self.logger.info('Using crop "%s" for input "%s"', crop, name)
-            return crop
-
-    def transcode(self, path, crop, meta):
+    def transcode(self, path, meta):
         name = os.path.basename(path)
         output_name = os.path.splitext(name)[0] + '.mkv'
         output = os.path.join(self.WORK_DIRECTORY, output_name)
@@ -264,11 +221,16 @@ class Transcoder(object):
                 self.logger.info('Removing old work output: "%s"', workpath)
                 os.unlink(workpath)
 
+        #TODO: Parse resolution and determine settings
+
+        #TODO: Get crop from directory
+        crop = 'detect'
+
         command_parts = [
-            'transcode-video.sh',
-            '--crop %s' % crop,
-            self.parse_audio_tracks(meta),
-            self.parse_subtitle_tracks(meta),
+            'transcode-video',
+            '--crop ' + crop,
+            '--add-audio all',
+            '--add-subtitle all',
             self.TRANSCODE_OPTIONS,
             '--output "%s"' % output,
             '"%s"' % path
@@ -285,68 +247,11 @@ class Transcoder(object):
         self.logger.info('Transcoding completed for input "%s"', name)
         return output
 
-    def parse_subtitle_tracks(self, meta):
-        pos = meta.find('+ subtitle tracks:')
-        track_re = r'^\s+\+\s(?P<track>[0-9]+),\s(?P<language>[^\(\n]*)'
-        # language may be useful for some kind of filter
-        subtitle_tracks = []
-        for line in meta[pos:].split('\n')[1:]:
-            if line.startswith('HandBrake'):
-                break
-            match = re.match(track_re, line)
-            if match:
-                self.logger.info('Adding subtitle track #%s (%s)',
-                                 match.group(1), match.group(2).rstrip())
-                subtitle_tracks.append('--add-subtitle %s' % (match.group(1)))
-        return ' '.join(subtitle_tracks)
-
-    def parse_audio_tracks(self, meta):
-        "Parse the meta info for audio tracks beyond the first one"
-
-        # find all the audio streams and their optional language and title data
-        streams = []
-        stream_re = r'(\s{4}Stream #[0-9]+\.[0-9]+(?:\((?P<lang>[a-z]+)\))?: Audio:.*?\n)(?=(?:\s{4}Stream)|(?:[^\s]))'
-        title_re = r'^\s{6}title\s+:\s(?P<title>[^\n]+)'
-        for stream, lang in re.findall(stream_re, meta, re.DOTALL | re.MULTILINE):
-            lang = lang = ''
-            title = ''
-            title_match = re.search(title_re, stream, re.MULTILINE)
-            if title_match:
-                title = title_match.group(1)
-            streams.append({'title': title, 'lang': lang})
-
-        # find the audio track numbers
-        tracks = []
-        pos = meta.find('+ audio tracks:')
-        track_re = r'^\s+\+\s(?P<track>[0-9]+),\s(?P<title>[^\(\n]*)'
-        for line in meta[pos:].split('\n')[1:]:
-            if line.startswith('  + subtitle tracks:'):
-                break
-            match = re.match(track_re, line)
-            if match:
-                tracks.append({'number': match.group(1),
-                               'title': match.group(2).rstrip()})
-
-        # assuming there's an equal number of tracks and streams, we can
-        # match up stream titles to tracks and have a nicer output
-        use_stream_titles = len(streams) == len(tracks)
-        additional_tracks = []
-
-        for i, track in enumerate(tracks[1:]):
-            title = ''
-            if use_stream_titles:
-                title = streams[i+1]['title']
-            title = title or track['title']
-            # remove any quotes in the title so we don't mess up the command
-            title = title.replace('"', '')
-            self.logger.info('Adding audio track #%s with title: %s',
-                             track['number'], title)
-            additional_tracks.append('--add-audio %s,"%s"' % (
-                track['number'], title.replace('"', '')))
-
-        return ' '.join(additional_tracks)
-
 
 if __name__ == '__main__':
+    print(len(sys.argv))
+    print(sys.argv[1:])
+    print(' '.join(sys.argv[1:]))
+
     transcoder = Transcoder()
     transcoder.run()
